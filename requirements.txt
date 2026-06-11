@@ -1,0 +1,6 @@
+streamlit
+google-genai
+python-dotenv
+scikit-learn
+numpy
+#pip install -U langsmith python-dotenv
