@@ -61,7 +61,7 @@ def retrieve(question,
              texts,
              vectorizer,
              vectors,
-             top_k=3):
+             top_k=10):
 
     q_vector = vectorizer.transform([question])
 
@@ -147,7 +147,7 @@ def ask_gemini(question,
     client = load_gemini()
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         contents=prompt
     )
 

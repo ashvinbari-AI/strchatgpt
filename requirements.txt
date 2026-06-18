@@ -3,4 +3,11 @@ google-genai
 python-dotenv
 scikit-learn
 numpy
-#pip install -U langsmith python-dotenv
+#pip install -U langsmith python-dotenv 
+streamlit>=1.28.0
+scikit-learn>=1.3.0
+python-dotenv>=1.0.0
+google-generativeai>=0.3.0
+langchain>=0.1.0
+langchain-google-genai>=0.0.3
+langsmith>=0.0.77
