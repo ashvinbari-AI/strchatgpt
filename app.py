@@ -2,16 +2,28 @@ import streamlit as st
 import json
 import os
 from dotenv import load_dotenv
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from google import genai
+from google import genai 
+from langsmith import wrappers 
+from langsmith import traceable
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
 
+# ----------------------------
+# Load Environment Variables
+# ----------------------------
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 JSON_PATH = r"A:\paper_agent\output\loksatta_complete.json"
 
+COLLECTION_NAME = "loksatta"
+
+QDRANT_PATH = "./qdrant_db"
+
+# ----------------------------
+# Streamlit Config
+# ----------------------------
 
 st.set_page_config(
     page_title="लोकसत्ता सहाय्यक",
@@ -19,93 +31,144 @@ st.set_page_config(
     layout="wide"
 )
 
+# ----------------------------
+# Load JSON Metadata
+# ----------------------------
 
 @st.cache_resource
-def load_data():
+def load_metadata():
 
     with open(JSON_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    pages = data["pages"]
+    return data["extraction_date"], len(data["pages"])
 
-    texts = []
 
-    for page in pages:
-
-        texts.append(
-            {
-                "page": page["page_number"],
-                "text": page["text"]
-            }
-        )
-
-    return texts, data["extraction_date"]
-
+# ----------------------------
+# Load Embedding Model
+# ----------------------------
 
 @st.cache_resource
-def build_index(texts):
+def load_embedding_model():
 
-    corpus = [x["text"] for x in texts]
-
-    vectorizer = TfidfVectorizer(
-        stop_words=None,
-        max_features=10000
+    return SentenceTransformer(
+        "BAAI/bge-m3",
+        trust_remote_code=True
     )
 
-    vectors = vectorizer.fit_transform(corpus)
 
-    return vectorizer, vectors
+# ----------------------------
+# Load Qdrant
+# ----------------------------
 
+@st.cache_resource
+def load_qdrant():
 
-def retrieve(question,
-             texts,
-             vectorizer,
-             vectors,
-             top_k=10):
-
-    q_vector = vectorizer.transform([question])
-
-    scores = cosine_similarity(
-        q_vector,
-        vectors
-    )[0]
-
-    indices = scores.argsort()[-top_k:][::-1]
-
-    results = []
-
-    for idx in indices:
-
-        results.append(
-            {
-                "page": texts[idx]["page"],
-                "text": texts[idx]["text"],
-                "score": scores[idx]
-            }
-        )
-
-    return results
+    return QdrantClient(path=QDRANT_PATH)
 
 
+# ----------------------------
+# Gemini Client
+# ----------------------------
 @st.cache_resource
 def load_gemini():
 
-    return genai.Client(
+    gemini_client = genai.Client(
         api_key=GEMINI_API_KEY
     )
 
+    traced_client = wrappers.wrap_gemini(
+        gemini_client,
+        tracing_extra={
+            "tags": [
+                "streamlit",
+                "marathi-news",
+                "rag",
+                "gemini"
+            ],
+            "metadata": {
+                "llm": "gemini-2.5-flash",
+                "embedding": "BAAI/bge-m3",
+                "vectordb": "Qdrant"
+            }
+        }
+    )
 
-def ask_gemini(question,
-               retrieved_pages,
-               date):
+    return traced_client
+# @st.cache_resource
+# def load_gemini():
+
+#     return genai.Client(api_key=GEMINI_API_KEY)
+
+
+# ----------------------------
+# Retrieve Documents
+# ----------------------------
+
+
+
+@traceable(name="Retrieve Documents")
+def retrieve(question, top_k=5):  # Reduced from 10 to 5
+
+    model = load_embedding_model()
+
+    qdrant = load_qdrant()
+
+    query_vector = model.encode(
+        question,
+        normalize_embeddings=True
+    )
+
+    search_result = qdrant.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=query_vector.tolist(),
+        limit=top_k
+    )
+
+    docs = []
+
+    SIMILARITY_THRESHOLD = 0.60
+
+    for hit in search_result:
+
+        if hit.score < SIMILARITY_THRESHOLD:
+            continue
+
+        docs.append({
+            "page": hit.payload["page"],
+            "text": hit.payload["text"][:800],   # Reduce context
+            "score": hit.score
+        })
+
+    return docs
+
+# ----------------------------
+# Ask Gemini
+# ----------------------------
+
+@traceable(name="Marathi Newspaper RAG")
+def rag_pipeline(question, date):
+
+    retrieved = retrieve(question)
+
+    answer = ask_gemini(
+        question,
+        retrieved,
+        date
+    )
+
+    return answer, retrieved
+@traceable(name="Ask Gemini")
+def ask_gemini(question, retrieved_docs, date):
+
+    if not retrieved_docs:
+        return "माफ करा, या विषयाची माहिती उपलब्ध नाही."
 
     context = ""
 
-    pages_used = []
+    pages = sorted(set(item["page"] for item in retrieved_docs))
 
-    for item in retrieved_pages:
-
-        pages_used.append(str(item["page"]))
+    for item in retrieved_docs:
 
         context += f"""
 
@@ -118,66 +181,80 @@ def ask_gemini(question,
     prompt = f"""
 तुम्ही लोकसत्ता वृत्तपत्र सहाय्यक आहात.
 
-दिनांक:
+फक्त दिलेल्या संदर्भाचा वापर करा.
+
+जर माहिती उपलब्ध नसेल तर उत्तर द्या:
+
+"माफ करा, ही माहिती लोकसत्ता वर्तमानपत्रात उपलब्ध नाही."
+
+उत्तर मराठीत द्या.
+
+उत्तर 100 शब्दांमध्ये द्या.
+
+======================
+
+दिनांक
+
 {date}
 
-संदर्भ:
+======================
+
+संदर्भ
 
 {context}
 
-प्रश्न:
+======================
+
+प्रश्न
+
 {question}
 
-नियम:
+======================
 
-1. फक्त दिलेल्या संदर्भातील माहिती वापरा.
-
-2. माहिती नसेल तर म्हणा:
-"माफ करा, ही माहिती आजच्या बातमीत उपलब्ध नाही."
-
-3. अंदाज लावू नका.
-
-4. उत्तर मराठीत द्या.
-
-5. शेवटी वापरलेली पान क्रमांक सांगा.
-
-उत्तर:
+उत्तर
 """
 
     client = load_gemini()
 
     response = client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=prompt
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "max_output_tokens": 300
+        }
     )
 
-    return response.text
+    answer = response.text
 
+    answer += "\n\n📄 स्रोत पृष्ठे : "
+
+    answer += ", ".join(map(str, pages))
+
+    return answer
+# ----------------------------
+# Main App
+# ----------------------------
 
 def main():
 
     st.title("📰 लोकसत्ता बातमी सहाय्यक")
 
-    texts, date = load_data()
+    date, total_pages = load_metadata()
 
     st.info(
-        f"📅 दिनांक: {date} | "
-        f"📄 पाने: {len(texts)}"
+        f"📅 दिनांक : {date} | 📄 पाने : {total_pages}"
     )
-
-    vectorizer, vectors = build_index(texts)
 
     if "messages" not in st.session_state:
 
-        st.session_state.messages = []
-
-        st.session_state.messages.append(
+        st.session_state.messages = [
             {
                 "role": "assistant",
-                "content":
-                f"🙏 नमस्कार! मी {date} च्या लोकसत्ता बातम्यांचा सहाय्यक आहे."
+                "content": f"🙏 नमस्कार! मी {date} च्या लोकसत्ता बातम्यांचा AI सहाय्यक आहे."
             }
-        )
+        ]
 
     for msg in st.session_state.messages:
 
@@ -185,9 +262,7 @@ def main():
 
             st.markdown(msg["content"])
 
-    question = st.chat_input(
-        "प्रश्न विचारा..."
-    )
+    question = st.chat_input("प्रश्न विचारा...")
 
     if question:
 
@@ -204,14 +279,9 @@ def main():
 
         with st.chat_message("assistant"):
 
-            with st.spinner("🔍 बातमीत शोधत आहे..."):
+            with st.spinner("🔍 बातम्यांमध्ये शोध सुरू आहे..."):
 
-                retrieved = retrieve(
-                    question,
-                    texts,
-                    vectorizer,
-                    vectors
-                )
+                retrieved = retrieve(question)
 
                 answer = ask_gemini(
                     question,
@@ -221,13 +291,12 @@ def main():
 
                 st.markdown(answer)
 
-                with st.expander("📄 वापरलेली पाने"):
+                with st.expander("📄 Retrieved Pages"):
 
                     for item in retrieved:
 
                         st.write(
-                            f"पान {item['page']} "
-                            f"(score={item['score']:.2f})"
+                            f"Page {item['page']} | Similarity : {item['score']:.4f}"
                         )
 
         st.session_state.messages.append(
